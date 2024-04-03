@@ -1,4 +1,4 @@
-#!/usr/bin/with-contenv bashio
+#!/usr/bin/env sh
 
 . /app/venv/bin/activate
 
