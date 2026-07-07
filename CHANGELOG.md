@@ -1,24 +1,199 @@
 # Changelog
 
+
+## [2.03]
+
+* Daly v2: fix MOSFET switch control — write regs `0x00A5` (charge) / `0x00A6` (discharge), confirmed by official-app HCI snoop; no password write needed (#356)
+
+
+## [2.02]
+
+* `type: snoop`: fingerprint incoming notifications against known protocol framing and suggest a `type:` (#375)
+
+
+## [2.01]
+
+* Daly v2: switch write that gets no echo logs a warning instead of blocking the mqtt queue 8s (#356)
+
+
+## [2.00]
+
+* Daly v2: cell voltages, MOSFET switch control, and correct charge/discharge MOSFET state (#356)
+
+
+## [1.99]
+
+* Daly v2 (`type: daly2`, Modbus-over-BLE): make it actually work — the live I/O path was a non-functional stub that never sent the request and crashed on an assert. Proper Modbus CRC-16 framing, response reassembly across BLE notifications, and a `fff1/fff2` → `ff01/ff02` UUID fallback for newer DL/JHB firmware (#356)
+* SOC sensor: report `state_class: measurement` (alongside `device_class: battery`) so Home Assistant records long-term statistics and the SOC shows up in the energy dashboard's battery-level selector (#374)
+
+
+## [1.98]
+
+* JK: throttle the per-packet "crc check failed" log when the notify characteristic carries non-protocol junk (e.g. JK-PB inverter firmware flooding `AT\r\n` on the shared UART, #370) — one rate-limited line per 30s instead of an ERROR + full buffer per packet, so the log stays usable during a flood
+* Add `uart: true` to the manifest so wired BMSes (`address: serial`, e.g. `jk_uart`/`daly_uart`) work — the host serial devices are now mapped into the container; `privileged:` alone never exposed them (#22, #225)
+* Keep `publish_period`/`expire_values_after` as visible required fields again — under the collapsed "unused optional" section the HA frontend silently dropped edits on save (#225)
+
+
+## [1.97]
+
+* Add `translations/{en,de,es}.yaml` in English, German and Spanish
+* The new `snoop` BMS to explore unknown BMS types, pasive read-out or active probe spec writes from a `:families` suffix on `type:` (e.g. `type: snoop:jbd,jk,daly`) — see [doc/SNOOP.md](doc/SNOOP.md)
+* Add `noname_modbus` for generic Chinese BMSes that speak Modbus RTU over the Nordic UART Service (#131) — needs verification with a real device
+* Restore multi-arch Docker builds (aarch64/amd64/armhf/armv7/i386) — re-add `ARG BUILD_FROM` consumed by `build.yaml`, which 1.96 had dropped (#365)
+* JK: restore sub-1% SOC precision lost in 1.95 — recompute from `charge / aged_capacity` instead of using the BMS's 1% SOC byte, while keeping 1.95's `capacity` fix for aged 11.x packs (#369)
+
+
+## [1.96]
+
+* Add new bluetooth backend `esphome` for [ESPHome Bluetooth Proxy](https://esphome.io/components/bluetooth_proxy.html) devices — see README *BLE Stack* section for setup. Known incompatibility: ANT BMS.
+* Fix HA discovery topics when device alias contains `/` (#366)
+* Throttle telemetry writes to 15s and suffix InfluxDB measurement with address hash
+* InfluxDB: flush in a background task to avoid stalling the sample loop
+
+
+## [1.95]
+
+* Fix crash when   active balancers/meters report no `battery_level`/`current` (EK-24S4EB #357, CW20 #338)
+* Fix `UnicodeDecodeError` crash on JK BMS device info with non-UTF8 bytes (#349)
+* Harden ANT BMS device-info decode against non-UTF8 bytes
+* DALY: support newer firmware GATT layout (service 0000ff00, ff01/ff02) (#356)
+* JK: read pack capacity from settings frame, not BMS-aged value (#365)
+* CW20: fix against `aiobmsble` 0.23
+* Expose `soh` and `aged_capacity` (JK, ANT, Supervolt)
+* Fix `*_ble` current/power sign (charge/discharge meters were swapped)
+* Rename `cycle_capacity` → `total_charge_throughput`
+* Document the three BLE stacks (`bleak` / `bumble` / `bluek`) in the README
+* Add pack-temperature RC pipeline (estimate pack temp from cell + ambient)
+* Add `bt_diagnostics` BLE health snapshot
+* Collapse multi-page asyncio tracebacks on BLE errors into a one-line cause chain (#367)
+* Pin `bluek` to a known-good commit
+
+
+## [1.93]
+
+* Fixd Dockerfile BUILD_ARGS
+* Add new bluetooth backend `bumble` for exclusive adapter access (use a dedicated ble adapter)
+* Add new bluetooth backend `bluek` for direct BlueZ access (Linux only, bypass DBus)
+* Reverted connection logic back to v1.90 (most stable)
+
+## [1.92]
+
+* Connecting logic using shared scanner
+* Rename meters sensor names
+* Changed order of options schema so BMS alias is now visible in visual editor
+* Show RSSI during ble scanﬂ
+
+## [1.91]
+
+* `aioblebms` v0.12
+* fix numeric precision
+* implement shared scanners and connect lock
+* bleak v1.1.1
+* Add Atorch CW20
+* strip whitespaces from device addresses
+* reduce logging verbosity
+* lazy imports of bms specific code
+
+## [1.90]
+
+* fix `mqtt_util` import
+
+## [1.89]
+
+* fix `NoneType doesn't define round method`
+
+## [1.88]
+
+* Add litime BMS (thanks @KOSSOII)
+* Fix temperature reading on first sample
+* Fix: add `adapter` to options schema
+
+## [1.87]
+
+* Fix PSK (pin) pairing (victron)
+
+## [1.86]
+
+* Fix display precision in HA (you might need to remove the device from MQTT integration and restart batmon)
+
+## [1.85]
+
+* Fix `'BleakClient' object has no attribute 'get_services'`
+* Fix `MQTT_HOST: unbound variable` (https://github.com/fl4p/batmon-ha/issues/314)
+
+## [1.84]
+
+* Upgrade Bleak version 1.1.0
+* Fix MQTT port not being queried from Supervisor API
+* Fix cell voltages for BMS connected through BMS_BLE
+* Fix add-on startup with older versions of `bashio` (https://github.com/fl4p/batmon-ha/issues/296)
+* JK: increase timeout to 12 seconds
+* JK: fix char specifier for newer version (https://github.com/fl4p/batmon-ha/issues/310)
+* Add exponential wait on sampling error
+
+## [1.83]
+
+* Fix supervolt characteristic specifiers
+* JK-PB2A16S20: add float_charge switch
+* Add wrapper for ([BMS_BLE-HA](https://github.com/patman15/BMS_BLE-HA) wrapper) to enable support for Seplos, CBT BMS
+  and many more
+* Ignore influxdb setup error
+* Ignore pip return code when installing special pairing version of bleak
+* Fix add-on start-up bashio script if supervisor API is not reachable
+* Improved logging output on BLE connection issues
+* Pin python to version 3.12 in Dockerfile
+
+## [1.82]
+
+* Rollback bleak version to 0.20.2 (https://github.com/fl4p/batmon-ha/issues/275)
+* Fix JK frame version detection
+* Supervolt: add char UUIDs for newer version
+
+## [1.81]
+
+* Create separate venv with a modified bleak version for pairing.
+  Speeds up start-up and doesn't break with lost internet connection
+* Pin bleak version to  `0.22.3`
+* Remove `install_newer_bleak` version
+* Capture fetch_voltage errors and re-connect
+* Add `jk_24s` and `jk_32s` BMS types to explicitly set the JK version (disable auto-detect)
+* Add `daly2` type
+
+## [1.80] - 2024-12-28
+
+* Fix JK firmware detection (merge #267)
+
+## [1.79] - 2024-12-09
+
+* Fix #259 OverflowError
+* pin paho version 2.1
+* fix daly2 @patman15
+* changed jk frame version detection
+
 ## [1.78] - 2024-02-18
+
 * Fix `NameError: name 'logger' is not defined`
 
 ## [1.77] - 2024-02-16
+
 * Fix meter rounding (https://github.com/fl4p/batmon-ha/issues/169)
 * Fix paho 2.0 compatibility (https://github.com/fl4p/batmon-ha/issues/195)
 * JK add temperature sensor 3 and 4
 
 ## [1.76] - 2024-01-17
+
 * Add JK Balance switch
 * allow forward slash `/` in mqtt topic prefix
 
 ## [1.75] - 2023-12-16
+
 * fix HA install error (https://github.com/fl4p/batmon-ha/issues/175)
 * fix meter expiry
 * optimized sampling schedule
 * add temperature noise filter
 
 ## [1.74] - 2023-11-26
+
 * Add Daly checksum verification (https://github.com/fl4p/batmon-ha/issues/158)
 * Fix daly bms num_responses (https://github.com/fl4p/batmon-ha/issues/163)
 * Ignore voltage fetch errors and continue (https://github.com/fl4p/batmon-ha/issues/163)
@@ -32,11 +207,13 @@
 * InfluxDB add GZIP compression
 
 ## [1.73] - 2023-11-10
+
 this is a rather big update. I've set version num to 1.0, so it looks more tidy.
+
 * add manufacturer to device info
 * start scanner if device not discovered
 * influxdb publish meters
-* add additional watchdog thread (to detect event loop issues) 
+* add additional watchdog thread (to detect event loop issues)
 * incr meter integral recovery time to 10 minutes
 * add unit tests
 * futures pool add  `acquire_timeout`
@@ -54,6 +231,7 @@ this is a rather big update. I've set version num to 1.0, so it looks more tidy.
 * soc algo fix and assert thresholds
 
 ## [0.0.72] - 2023-10-19
+
 * Fix JK BLE characteristic handles
 * Remove `influxdb` requirement and install if needed
 * Fix SoC for groups

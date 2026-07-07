@@ -5,6 +5,11 @@ https://github.com/syssi/esphome-ant-bms/blob/main/components/ant_bms_ble/ant_bm
 https://github.com/juamiso/ANT_BMS
 https://github.com/Sgw32/BMSCtl
 
+Apps
+iOS / Macos
+*
+
+
 
 INFO:__main__:Connecting 9AA68C04-9C48-4FAD-7798-13ABB4878996
 INFO:__main__:Connected: True
@@ -66,12 +71,15 @@ class AntBt(BtBms):
         self._switches = None
         self._last_response = None
         self._voltages = []
+        self.char = None
 
     def _notification_handler(self, sender, data: bytes):
 
         # MAX_RESPONSE_SIZE = 152
 
         # print("bms msg {0}: {1} {2}".format(sender, to_hex_str(data), data))
+
+        # self.logger.info('bms msg %d %r', len(data), data)
 
         if data.startswith(b'\x7E\xA1'):
             self._buffer.clear()
@@ -85,7 +93,7 @@ class AntBt(BtBms):
             frame_len = 6 + data_len + 4
 
             if len(buf) < frame_len:
-                self.logger.warning('Unexpected size: header says %d, got %d bytes', frame_len, len(buf))
+                self.logger.warning('Unexpected size: header says %d, got %d bytes (%r)', frame_len, len(buf), buf)
                 buf.clear()
                 return
 
@@ -103,30 +111,49 @@ class AntBt(BtBms):
     async def connect(self, timeout=20, **kwargs):
         # await super().connect(**kwargs)
         try:
-            await super().connect(timeout=6)
+            await super().connect(timeout=timeout)
         except Exception as e:
-            self.logger.info("normal connect failed (%s), connecting with scanner", str(e) or type(e))
+            from bmslib.util import summarize_exc
+            self.logger.info("%s normal connect failed (%s), connecting with scanner",
+                             self.name, summarize_exc(e))
             await self._connect_with_scanner(timeout=timeout)
 
-        await self.start_notify(self.CHAR_UUID, self._notification_handler)
+        self.char = self.find_char(self.CHAR_UUID, 'notify')
+        await self.start_notify(self.char, self._notification_handler)
 
     async def disconnect(self):
-        await self.client.stop_notify(self.CHAR_UUID)
+        if self.char is not None:
+            try:
+                await self.client.stop_notify(self.char)
+            except Exception:
+                # HaBleakClientWrapper (esphome stack) raises AttributeError
+                # on services if _backend has been torn down; ignore.
+                pass
         await super().disconnect()
+        self.char = None
 
     async def _q(self, cmd: AntCommandFuncs, addr, val, resp_code):
         with await self._fetch_futures.acquire_timeout(resp_code, timeout=self.TIMEOUT/2):
-            await self.client.write_gatt_char(self.CHAR_UUID, data=_ant_command(cmd, addr, val))
+            # print('writing', _ant_command(cmd, addr, val))
+            # Force ATT_WRITE_CMD (no response). The char advertises both
+            # write and write-without-response. Default write-with-response
+            # triggers an auth check at ATT layer; via an ESPHome BT proxy
+            # the bond is non-trivial and we hit "Insufficient authorization
+            # (8)" before any data flows. WoR is fine because the BMS
+            # replies via notify on ffe1, not via the write-response.
+            await self.client.write_gatt_char(self.char, data=_ant_command(cmd, addr, val), response=False)
             return await self._fetch_futures.wait_for(resp_code, self.TIMEOUT)
 
     async def fetch_device_info(self) -> DeviceInfo:
         buf: bytearray = await self._q(AntCommandFuncs.DeviceInfo, 0x026c, 0x20, resp_code=0x12)
-        hw = bytearray.decode(buf[6:6 + 16].strip(b'\0'), 'utf-8')
+        # errors='replace': don't crash sampling over a version string if firmware
+        # embeds non-UTF8 bytes (cf. #349 on JK).
+        hw = bytearray.decode(buf[6:6 + 16].strip(b'\0'), 'utf-8', 'replace')
         dev = DeviceInfo(
             mnf="ANT",
             model='ANT-' + hw,
             hw_version=hw,
-            sw_version=bytearray.decode(buf[22:22 + 16].strip(b'\0'), 'utf-8'),
+            sw_version=bytearray.decode(buf[22:22 + 16].strip(b'\0'), 'utf-8', 'replace'),
             name=None,
             sn=None,
         )
@@ -141,7 +168,11 @@ class AntBt(BtBms):
         u32 = lambda i: int.from_bytes(data[i:(i + 4)], byteorder='little', signed=False)
         i32 = lambda i: int.from_bytes(data[i:(i + 4)], byteorder='little', signed=True)
 
-        num_temp = data[8]
+        # data[8] (temp-sensor count) reads back flaky on some units; a bogus
+        # large value spawns junk temp entities and misaligns every field
+        # decoded after the temps block. ANT packs at most a handful of NTCs,
+        # so cap it to a sane upper bound.
+        num_temp = min(data[8], 8)
         num_cell = data[9]
         offset = 34
 
@@ -167,7 +198,10 @@ class AntBt(BtBms):
         soc = u16(offset)
         offset += 2
 
-        # soh = u16(offset)  # state of health
+        # SOH lives directly after SOC (matches aiobmsble ant_bms layout and
+        # the prior commented-out hint here). Verified against ant_8s_2temp
+        # fixture: byte at this offset reads 100, matching a fresh-battery SOH.
+        soh = u16(offset)
         offset += 2
 
         # dsg mos state
@@ -202,9 +236,10 @@ class AntBt(BtBms):
             # power=
             charge=charge,
             capacity=capacity,
-            cycle_capacity=cycle_charge,
+            total_charge_throughput=cycle_charge,
             # num_cycles=0,
             soc=soc,
+            soh=soh,
 
             temperatures=temperatures,
             mos_temperature=mos_temp,
@@ -228,7 +263,7 @@ class AntBt(BtBms):
         register_onoff = dict(charge=[0x0006, 0x0004], discharge=[0x0003, 0x0001], balance=[0x000D, 0x000E],
                               buzzer=[0x001E, 0x001F])
         addr = register_onoff[switch][0 if state else 1]
-        await self.client.write_gatt_char(self.CHAR_UUID, data=_ant_command(AntCommandFuncs.WriteRegister, addr, 0))
+        await self.client.write_gatt_char(self.char, data=_ant_command(AntCommandFuncs.WriteRegister, addr, 0), response=False)
 
     def debug_data(self):
         return self._last_response

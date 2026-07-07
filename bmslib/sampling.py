@@ -8,6 +8,7 @@ from collections import defaultdict
 from copy import copy
 from typing import Optional, List, Dict
 
+import bleak.exc
 import paho.mqtt.client
 
 import bmslib.bt
@@ -15,10 +16,10 @@ from bmslib.algorithm import create_algorithm, BatterySwitches
 from bmslib.bms import DeviceInfo, BmsSample, MIN_VALUE_EXPIRY
 from bmslib.cache.mem import mem_cache_deco
 from bmslib.group import BmsGroup, GroupNotReady
+from bmslib.mqtt_util import publish_sample, publish_cell_voltages, publish_temperatures, publish_hass_discovery, \
+    subscribe_switches, mqtt_single_out
 from bmslib.pwmath import Integrator, DiffAbsSum, LHQ
-from bmslib.util import get_logger
-from mqtt_util import publish_sample, publish_cell_voltages, publish_temperatures, publish_hass_discovery, \
-    subscribe_switches, mqtt_single_out, round_to_n
+from bmslib.util import get_logger, summarize_exc
 
 logger = get_logger(verbose=False)
 
@@ -56,7 +57,7 @@ class PeriodicBoolSignal:
 class BmsSampleSink:
     """ Interface of an arbitrary data sink of battery samples """
 
-    def publish_sample(self, bms_name: str, sample: BmsSample):
+    def publish_sample(self, bms_name: str, sample: BmsSample, tags=None):
         raise NotImplementedError()
 
     def publish_voltages(self, bms_name: str, voltages: List[int]):
@@ -113,6 +114,7 @@ class BmsSampler:
 
         self._num_errors = 0
         self._time_next_retry = 0
+        self._last_diag_t = 0
 
         self.algorithm = None
         if algorithms:
@@ -156,14 +158,15 @@ class BmsSampler:
             if s:
                 self._num_errors = 0
             return s
-        except bmslib.bt.BleakDeviceNotFoundError:
-            t_wait = min(1.5 ** self._num_errors, 120)
-            logger.error("%s device not found, retry in %d seconds", self.bms, t_wait)
+        except (bmslib.bt.BleakDeviceNotFoundError, bmslib.bt.BleakNotFoundError) as e:
+            t_wait = 1.5 ** min(self._num_errors + 4, 14)
+            logger.error("%s device not found, retry in %d seconds (%s)", self.bms, t_wait, str(e) or type(e).__name__)
             self._time_next_retry = time.time() + t_wait
             return None
 
         except SampleExpiredError as e:
-            logger.warning("%s: expired: %s", self.bms.name, e)
+            if self._num_errors < 3:
+                logger.warning("%s: expired: %s", self.bms.name, e)
             return None
 
         except GroupNotReady as e:
@@ -174,11 +177,36 @@ class BmsSampler:
             return None
 
         except Exception as ex:
-            logger.error('%s error (#%d): %s', self.bms.name, self._num_errors, str(ex) or str(type(ex)), exc_info=1)
+            # Collapse the multi-page asyncio.wait_for traceback that masks the
+            # real cause for connect/notify timeouts (see #367, #324). Full
+            # exc_info kept for unexpected types where the trace is informative.
+            short_trace_types = (TimeoutError, asyncio.TimeoutError, OSError,
+                                 bleak.exc.BleakError)
+            if isinstance(ex, bmslib.bt.BleakCharacteristicNotFoundError):
+                logger.error('%s error (#%d): %s', self.bms.name, self._num_errors,
+                             str(ex) or type(ex).__name__)
+            elif isinstance(ex, short_trace_types):
+                logger.error('%s error (#%d): %s', self.bms.name, self._num_errors,
+                             summarize_exc(ex))
+            else:
+                logger.error('%s error (#%d): %s', self.bms.name, self._num_errors,
+                             str(ex) or str(type(ex)), exc_info=True)
+
             dd = self.bms.debug_data()
             dd and logger.info("%s bms debug data: %s", self.bms.name, dd)
             self.device_info and logger.info('%s device info: %s', self.bms.name, self.device_info)
-            logger.info('Bleak version %s', bmslib.bt.bleak_version())
+
+            if isinstance(ex, short_trace_types) and (t_now - self._last_diag_t) > 30:
+                self._last_diag_t = t_now
+                logger.info('%s stack: Bleak %s, %s', self.bms.name,
+                            bmslib.bt.bleak_version(), bmslib.bt.bt_stack_version())
+                try:
+                    await bmslib.bt.bt_diagnostics(
+                        self.bms.address, getattr(self.bms, '_adapter', None),
+                        logger, timeout=3.0)
+                except Exception as de:
+                    logger.warning('%s bt_diagnostics failed: %s', self.bms.name,
+                                   str(de) or type(de).__name__)
 
             bms = self.bms
             t_interact = max(self._t_wd_reset, self.bms.connect_time)
@@ -216,13 +244,15 @@ class BmsSampler:
 
         t_conn = time.time()
 
+        err = False
+
         if not was_connected and t_conn < self._time_next_retry:
             logger.debug('retry in %.0f sec', self._time_next_retry - t_conn)
             await asyncio.sleep(4)
             return None
 
         if not was_connected and not bms.is_virtual:
-            logger.info('connecting bms %s', bms)
+            logger.debug('connecting bms %s', bms)
 
         async with bms:
             if not was_connected:
@@ -302,8 +332,9 @@ class BmsSampler:
             for sink in self.sinks:
                 try:
                     sink.publish_sample(bms.name, sample)
-                except:
-                    logger.error(sys.exc_info(), exc_info=True)
+                except Exception as e:
+                    logger.error('sink %s publish_sample failed: %s',
+                                 type(sink).__name__, summarize_exc(e))
 
             self.downsampler += sample
 
@@ -314,7 +345,7 @@ class BmsSampler:
             voltages = []
 
             async def cached_fetch_voltages():
-                nonlocal voltages
+                nonlocal voltages, err
                 if voltages:
                     return voltages
 
@@ -326,6 +357,7 @@ class BmsSampler:
                         self.bms_group.update_voltages(bms, voltages)
                 except:
                     logger.error("%s error fetching voltage", bms.name, exc_info=1)
+                    err = True
                     voltages = None
 
                 return voltages
@@ -340,12 +372,13 @@ class BmsSampler:
             #    logger.info('%s Power z_score %.1f (avg=%.0f std=%.2f last=%.0f)', bms.name, z_score, self.power_stats.avg.value, self.power_stats.stddev, sample.power)
 
             PWR_CHG_REG = 120  # regularisation to suppress changes when power is low
-            PWR_CHG_HOLD = 4
+            PWR_CHG_HOLD = 4  # time in seconds to keep high frequency sampling after a power jump. this helps capture power transients and noise wave form
             power_chg = (sample.power - self._last_power) / (abs(self._last_power) + PWR_CHG_REG)
             if not bms.is_virtual and abs(power_chg) > 0.15 and abs(sample.power) > abs(self._last_power):
                 if bms.verbose_log or (
-                        not self.period_pub and (t_now - self._t_last_power_jump) > PWR_CHG_HOLD):
-                    logger.info('%s Power jump %.0f %% (prev=%.0f last=%.0f, REG=%.0f)', bms.name, power_chg * 100,
+                        not self.period_pub and (t_now - self._t_last_power_jump) > PWR_CHG_HOLD * 10):
+                    logger.info('%s Power jump/noise %.0f %% (prev=%.0f last=%.0f, REG=%.0f)', bms.name,
+                                power_chg * 100,
                                 self._last_power, sample.power, PWR_CHG_REG)
                 self._t_last_power_jump = t_now
             self._last_power = sample.power
@@ -371,7 +404,8 @@ class BmsSampler:
                                          temperatures=sample.temperatures)
 
                 if log_data and (voltages or sample.temperatures) and not bms.is_virtual:
-                    logger.info('%s volt=[%s] temp=%s', bms.name, ','.join(map(str, voltages)),
+                    logger.info('%s volt=[%s] temp=%s', bms.name,
+                                ','.join(map(str, voltages)) if voltages else voltages,
                                 sample.temperatures)
 
             if self.period_discov or self.period_30s:
@@ -379,7 +413,7 @@ class BmsSampler:
 
             # publish home assistant discovery every 60 samples
             if self.period_discov:
-                logger.info("Sending HA discovery for %s (num_samples=%d)", bms.name, self.num_samples)
+                logger.debug("Sending HA discovery for %s (num_samples=%d)", bms.name, self.num_samples)
                 if self.device_info is None:
                     await self._try_fetch_device_info()
                 publish_hass_discovery(
@@ -408,11 +442,13 @@ class BmsSampler:
         dt_fetch = t_disc - t_fetch
         dt_max = max(dt_conn, dt_fetch)
         if bms.verbose_log or (  # or dt_max > 1
-                dt_max > 0.01 and random.random() < (0.05 if sample.num_samples < 1e3 else 0.01)
+                dt_max > 0.01 and random.random() < (0.05 if sample.num_samples < 1e3 else 0.01) * (dt_conn + dt_fetch)
                 and not bms.is_virtual and log_data):
-            logger.info('%s times: connect=%.2fs fetch=%.2fs', bms, dt_conn, dt_fetch)
+            if (dt_conn > 1e-2 or dt_fetch > 1e-2):
+                logger.info('%s times: connect=%.2fs fetch=%.2fs', bms, dt_conn, dt_fetch)
 
-        return sample
+        # pass "light" errors to the caller to trigger a re-connect after too many
+        return sample if not err else None
 
     def publish_meters(self):
         device_topic = self.mqtt_topic_prefix
@@ -428,12 +464,16 @@ class BmsSampler:
                     sink.publish_meters(self.bms.name, readings)
                 except NotImplementedError:
                     pass
-                except:
-                    logger.error(sys.exc_info(), exc_info=True)
+                except Exception as e:
+                    logger.error('sink %s publish_meters failed: %s',
+                                 type(sink).__name__, summarize_exc(e))
 
     async def _try_fetch_device_info(self):
         try:
-            self.device_info = await self.bms.fetch_device_info()
+            di = await self.bms.fetch_device_info()
+            if self.device_info is None:
+                logger.info('%s device_info=%s', self.bms.name, di)
+            self.device_info = di
         except NotImplementedError:
             pass
         except Exception as e:

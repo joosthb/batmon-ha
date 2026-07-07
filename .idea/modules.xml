@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/offgrid.iml" filepath="$PROJECT_DIR$/.idea/offgrid.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/batmon.iml" filepath="$PROJECT_DIR$/.idea/batmon.iml" />
     </modules>
   </component>
 </project>

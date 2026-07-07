@@ -29,19 +29,20 @@ def calc_crc(message_bytes):
     return sum(message_bytes) & 0xFF
 
 
-def daly_command_message(command: int, extra=""):
+def daly_command_message(command: int, extra="", address: int = 8):
     """
     Takes the command ID and formats a request message
 
     :param command: Command ID ("90" - "98")
     :param extra:
+    :param address: Daly host-address byte. 4 = USB / RS485, 8 = Bluetooth.
+        Defaults to 8 (BLE) for backward compatibility.
     :return: Request message as bytes
     """
     # 95 -> a58095080000000000000000c2
 
     assert isinstance(command, int)
-
-    address = 8  # 4 = USB, 8 = Bluetooth
+    assert address in (4, 8), "Daly host address must be 4 (USB) or 8 (BLE)"
 
     message = "a5%i0%02x08%s" % (address, command, extra)
     #          "a5%i0%s  08%s"
@@ -60,10 +61,13 @@ class DalyBt(BtBms):
     TEMPERATURE_STEP = 1
     TEMPERATURE_SMOOTH = 40
 
+    # Daly host-address byte (4 = USB / RS485, 8 = BLE). DalyUart overrides.
+    WIRE_ADDRESS = 8
+
     def __init__(self, address, **kwargs):
-        if kwargs.get('psk'):
-            self.logger.warning('JBD usually does not use a pairing PIN')
         super().__init__(address, **kwargs)
+        if kwargs.get('pin'):
+            self.logger.warning('Daly usually does not use a pairing PIN')
         self.UUID_RX = None
         self.UUID_TX = None
         self._fetch_nr: Dict[int, list] = {}
@@ -121,19 +125,29 @@ class DalyBt(BtBms):
         try:
             await super().connect(timeout=timeout)
         except Exception as e:
-            self.logger.info("normal connect failed (%s), connecting with scanner", str(e) or type(e))
+            self.logger.info("%s normal connect failed (%s), connecting with scanner", self.name, str(e) or type(e))
             await self._connect_with_scanner(timeout=timeout)
 
+        # rx, tx, sx
+        # sx:
         CHARACTERISTIC_UUIDS = [
             (17, 15, 48),  # TODO these should be replaced with the actual UUIDs to avoid conflicts with other BMS
             ('0000fff1-0000-1000-8000-00805f9b34fb', '0000fff2-0000-1000-8000-00805f9b34fb',
              '02f00000-0000-0000-0000-00000000ff01'),  # (15,19,31)
+            # Newer DALY firmware (DL/JHB prefix, #356) exposes service 0000ff00 with
+            # ff01=notify(rx) / ff02=write(tx). On these devices the legacy fff1 notify
+            # returns org.bluez.Error.NotPermitted, so we fall through to this layout.
+            ('0000ff01-0000-1000-8000-00805f9b34fb', '0000ff02-0000-1000-8000-00805f9b34fb',
+             '0000ff02-0000-1000-8000-00805f9b34fb'),
         ]
 
         for rx, tx, sx in CHARACTERISTIC_UUIDS:
             try:
                 await self.client.start_notify(rx, self._notification_callback)
-                await self.client.write_gatt_char(sx, bytearray(b""))
+                try:
+                    await self.client.write_gatt_char(sx, bytearray(b""))
+                except:
+                    await self.client.write_gatt_char(tx, bytearray(b""))
                 self.UUID_RX = rx
                 self.UUID_TX = tx
                 self.logger.debug("found rx uuid to be working: %s (tx %s, sx %s)", rx, tx, sx)
@@ -152,7 +166,7 @@ class DalyBt(BtBms):
         await super().disconnect()
 
     async def _q(self, command: int, num_responses: int = 1):
-        msg = daly_command_message(command)
+        msg = daly_command_message(command, address=self.WIRE_ADDRESS)
         if num_responses > 1:
             self._fetch_nr[command] = [None] * num_responses
         else:
@@ -167,7 +181,7 @@ class DalyBt(BtBms):
             except TimeoutError:
                 n_recv = num_responses - self._fetch_nr.get(command, [None]).count(None)
                 raise TimeoutError(
-                    "timeout awaiting result %02x, got %d/%d responses" % (command, n_recv, num_responses))
+                    "timeout awaiting result for cmd=0x%02x, got %d/%d responses" % (command, n_recv, num_responses))
 
             return sample
 
@@ -299,7 +313,9 @@ class DalyBt(BtBms):
         voltages = []
         for i in range(num_resp):
             v = struct.unpack(">b 3h x", resp[i])
-            assert v[0] == i + 1, "out-of-order frame %s != #%s" % (v, i + 1)
+            if v[0] != i + 1:
+
+                raise ValueError("out-of-order frame %s != #%s" % (v, i + 1))
             voltages += v[1:]
         return voltages[0:num_cells]
 
